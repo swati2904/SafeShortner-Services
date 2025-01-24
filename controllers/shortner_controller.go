@@ -99,18 +99,6 @@ func UpdateShortURL(c *fiber.Ctx) error {
 		}
 	}
 
-	if input.CheckedPasscode && (len(input.Passcode) != 6 || input.Passcode == "") {
-		return responses.JSONResponse(c, fiber.StatusBadRequest, "Passcode must be 6 digits long", nil)
-	}
-
-	if input.CheckedCaptcha && (input.Captcha != "cell" && input.Captcha != "text") {
-		return responses.JSONResponse(c, fiber.StatusBadRequest, "Captcha must be either 'cell' or 'text'", nil)
-	}
-
-	if input.CheckedAccessControl && (len(input.CountryBlacklist) == 0) {
-		return responses.JSONResponse(c, fiber.StatusBadRequest, "Country blacklist cannot be empty when Access Control is enabled", nil)
-	}
-
 	// Build the update document
 	updateFields := bson.M{}
 	if input.NewShortURL != "" {
@@ -148,4 +136,104 @@ func UpdateShortURL(c *fiber.Ctx) error {
 	}
 
 	return responses.JSONResponse(c, fiber.StatusOK, "Short URL updated successfully", updateFields)
+}
+
+// Get fetch required validations
+func GetShortURLValidations(c *fiber.Ctx) error {
+	// Fetch the short URL from the request params
+	shortURL := c.Params("shortURL")
+	if shortURL == "" {
+		return responses.JSONResponse(c, fiber.StatusBadRequest, "Short URL is required", nil)
+	}
+
+	// Fetch the document from the database
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var shortner models.Shortner
+	err := configs.URLCollection.FindOne(ctx, bson.M{"shortURL": shortURL}).Decode(&shortner)
+	if err != nil {
+		return responses.JSONResponse(c, fiber.StatusNotFound, "Short URL not found", nil)
+	}
+
+	// Build the response to inform required validations
+	requiredFields := bson.M{}
+	if shortner.CheckedPasscode {
+		requiredFields["passcodeRequired"] = true
+	}
+	if shortner.CheckedCaptcha {
+		requiredFields["captchaRequired"] = true
+	}
+	if shortner.CheckedAccessControl {
+		requiredFields["accessControlRequired"] = true
+	}
+	if shortner.CheckedTimeZone {
+		requiredFields["timeZoneRequired"] = true
+	}
+
+	// Return required validation details
+	return responses.JSONResponse(c, fiber.StatusOK, "Validations required for this short URL", requiredFields)
+}
+
+//get validate and redirect
+
+// Step 2: GET /validate/:shortURL
+func ValidateAndRedirectShortURL(c *fiber.Ctx) error {
+	shortURL := c.Params("shortURL")
+	if shortURL == "" {
+		return responses.JSONResponse(c, fiber.StatusBadRequest, "Short URL is required", nil)
+	}
+
+	passcode := c.Query("passcode")
+	captcha := c.Query("captcha")
+	country := c.Query("country")
+	currentTime := time.Now()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var shortner models.Shortner
+	err := configs.URLCollection.FindOne(ctx, bson.M{"shortURL": shortURL}).Decode(&shortner)
+	if err != nil {
+		return responses.JSONResponse(c, fiber.StatusNotFound, "Short URL not found", nil)
+	}
+
+	// Validate passcode
+	if shortner.CheckedPasscode && shortner.Passcode != passcode {
+		return responses.JSONResponse(c, fiber.StatusForbidden, "Invalid passcode", nil)
+	}
+
+	// Validate captcha
+	if shortner.CheckedCaptcha && shortner.Captcha != captcha {
+		return responses.JSONResponse(c, fiber.StatusForbidden, "Invalid captcha", nil)
+	}
+
+	// Access control
+	if shortner.CheckedAccessControl && contains(shortner.CountryBlacklist, country) {
+		return responses.JSONResponse(c, fiber.StatusForbidden, "Access from this country is restricted", nil)
+	}
+
+	// Expiry check
+	if shortner.CheckedTimeZone {
+		expiryTime, err := time.Parse("01/02/2006 03:04PM", shortner.ExpiryDateTime)
+		if err != nil {
+			return responses.JSONResponse(c, fiber.StatusInternalServerError, "Invalid expiry time format", nil)
+		}
+		if currentTime.After(expiryTime) {
+			return responses.JSONResponse(c, fiber.StatusGone, "Link has expired", nil)
+		}
+	}
+
+	// If all validations pass, redirect to the long URL
+	return c.Redirect(shortner.LongURL)
+}
+
+// helper function to check if string exist
+func contains(arr []string, value string) bool {
+	for _, v := range arr {
+		if v == value {
+			return true
+		}
+	}
+	return false
 }
